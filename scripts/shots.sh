@@ -49,7 +49,7 @@ mkdir -p "$OUT"
 echo "браузер: $BROWSER"
 echo "адрес:   $URL"
 
-node "$HERE/shots.js" "$URL" "$OUT" "$LABEL" "$BROWSER"
+node "$HERE/shots.cjs" "$URL" "$OUT" "$LABEL" "$BROWSER"
 rc=$?
 
 echo
