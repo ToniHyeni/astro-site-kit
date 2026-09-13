@@ -9,7 +9,7 @@ DIST="${1:-dist}"
 command -v python3 >/dev/null || { echo "нужен python3"; exit 2; }
 
 python3 - "$DIST" <<'PY'
-import sys, os, json
+import sys, os, json, re
 from html.parser import HTMLParser
 from urllib.parse import urlparse, unquote
 
@@ -83,26 +83,37 @@ class Page(HTMLParser):
             self.jsonld[-1] += data
 
 def srcset_urls(value):
-    """Адреса из srcset: 'a.webp 320w, b.webp 640w' -> ['a.webp', 'b.webp']."""
+    """Адреса из srcset: 'a.webp 320w, b.webp 640w' -> ['a.webp', 'b.webp'].
+    Встроенные data-адреса вырезаются целиком: внутри них своя запятая,
+    и разбиение по запятой рвало бы их на куски."""
     if not value:
         return []
+    cleaned = re.sub(r'data:\S+', ' ', value)
     out = []
-    for part in value.split(','):
-        part = part.strip()
-        if part:
-            out.append(part.split()[0])
+    for part in cleaned.split(','):
+        first = part.strip().split()[:1]
+        if not first:
+            continue
+        # от вырезанного data-адреса остаётся его дескриптор вида 1x или 640w
+        if re.fullmatch(r'[\d.]+[wx]', first[0]):
+            continue
+        out.append(first[0])
     return out
 
 
+# Схемы, которые проверять не нам. Всё остальное считаем внутренней ссылкой:
+# путь вида "C:\\Users\\..." формально имеет схему "c", но на сервере это 404.
+EXTERNAL = {'http', 'https', 'mailto', 'tel', 'data', 'javascript', 'ftp', 'sms', 'whatsapp', 'viber', 'tg'}
+
+
 def local(url):
-    """Ссылка ведёт внутрь сайта - её можно проверить на месте.
-    Всё, у чего есть схема (https:, mailto:, tel:, javascript:), - не наше дело."""
+    """Ссылка ведёт внутрь сайта - её можно проверить на месте."""
     if not url:
         return False
     u = url.strip()
     if u.startswith('//'):
         return False
-    return not urlparse(u).scheme
+    return urlparse(u).scheme.lower() not in EXTERNAL
 
 def resolve(href, page_path):
     """Куда на диске смотрит внутренняя ссылка."""

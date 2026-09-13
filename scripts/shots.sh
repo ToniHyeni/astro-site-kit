@@ -4,6 +4,8 @@
 # горизонтальный перелив. Кладёт в evidence/shots/. Сайт не меняет.
 #   ./scripts/shots.sh http://localhost:4321            одна страница
 #   ./scripts/shots.sh https://домен/uslugi/ uslugi     с меткой в имени файла
+#   SHOTS_WAIT=12 ./scripts/shots.sh ...                 ждать дорисовки дольше
+# Коды: 0 - снято, 1 - поломка вёрстки (перелив), 2 - снять нечем.
 set -uo pipefail
 URL="${1:-}"
 LABEL="${2:-}"
@@ -11,7 +13,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="evidence/shots"
 
 [ -z "$URL" ] && { echo "укажи адрес: ./scripts/shots.sh http://localhost:4321"; exit 2; }
-command -v node >/dev/null 2>&1 || { echo "нужен node - он и так стоит рядом с Astro"; exit 2; }
+command -v node >/dev/null 2>&1 || { echo "нужен node 22 или новее - он и так стоит рядом с Astro"; exit 2; }
 
 # Браузер ищем по обычным местам. Версия из snap идёт последней: она не пишет
 # файлы вне домашней папки и молча отдаёт пустой снимок.
@@ -51,8 +53,12 @@ node "$HERE/shots.js" "$URL" "$OUT" "$LABEL" "$BROWSER"
 rc=$?
 
 echo
+if [ "$rc" -eq 2 ]; then
+  echo "ИТОГ: снять нечем - смотри причину выше. Это не вердикт о вёрстке."
+  exit 2
+fi
 if [ "$rc" -ne 0 ]; then
-  echo "ИТОГ: съёмка не пройдена - смотри причину выше"
+  echo "ИТОГ: съёмка нашла поломку вёрстки - смотри выше"
   exit 1
 fi
 echo "ИТОГ: три скриншота в $OUT"

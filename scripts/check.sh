@@ -21,7 +21,8 @@ URL=""
 from_project() {
   [ -f "$PROJECT_FILE" ] || return 1
   grep -m1 -- "$1" "$PROJECT_FILE" 2>/dev/null \
-    | sed -e 's/.*\*\*[^*]*\*\*//' -e 's/`//g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+    | sed -e 's/^[^*]*\*\*[^*]*\*\*//' -e 's/\*\*.*$//' -e 's/`//g' \
+          -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
 v="$(from_project 'Команда сборки:')"       ; [ -n "${v:-}" ] && BUILD="$v"
 v="$(from_project 'Куда кладётся результат:')"; [ -n "${v:-}" ] && DIST="$v"
