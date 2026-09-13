@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
 # Скриншоты страницы в трёх ширинах: широкий экран, планшет, телефон.
-# Кладёт в evidence/shots/. Ничего не меняет на сайте.
-#   ./scripts/shots.sh http://localhost:4321           одна страница
-#   ./scripts/shots.sh https://домен/uslugi/ uslugi    с меткой в имени файла
+# Снимает страницу целиком, проверяет, что открылась именно она, и меряет
+# горизонтальный перелив. Кладёт в evidence/shots/. Сайт не меняет.
+#   ./scripts/shots.sh http://localhost:4321            одна страница
+#   ./scripts/shots.sh https://домен/uslugi/ uslugi     с меткой в имени файла
 set -uo pipefail
 URL="${1:-}"
 LABEL="${2:-}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="evidence/shots"
 
 [ -z "$URL" ] && { echo "укажи адрес: ./scripts/shots.sh http://localhost:4321"; exit 2; }
+command -v node >/dev/null 2>&1 || { echo "нужен node - он и так стоит рядом с Astro"; exit 2; }
 
-# Браузер ищем по обычным местам: на разных машинах он называется по-разному.
-# Сначала пробуем браузер от playwright: версия из snap не умеет писать файлы
-# за пределы домашней папки и молча отдаёт пустой скриншот.
+# Браузер ищем по обычным местам. Версия из snap идёт последней: она не пишет
+# файлы вне домашней папки и молча отдаёт пустой снимок.
 BROWSER=""
 for c in "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux64/chrome \
          "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux/chrome \
-         "$HOME"/.cache/ms-playwright/chromium_headless_shell-*/chrome-linux64/headless_shell; do
+         "$HOME"/.cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell; do
   [ -x "$c" ] && { BROWSER="$c"; break; }
 done
 if [ -z "$BROWSER" ]; then
@@ -24,47 +26,33 @@ if [ -z "$BROWSER" ]; then
     command -v "$c" >/dev/null 2>&1 && { BROWSER="$(command -v "$c")"; break; }
   done
 fi
-[ -z "$BROWSER" ] && { echo "не нашёл браузер. Поставь его: npx playwright install chromium"; exit 2; }
+[ -z "$BROWSER" ] && { echo "не нашёл браузер. Поставь: npx playwright install chromium"; exit 2; }
 
-case "$(readlink -f "$BROWSER")" in
-  /snap/*) echo "внимание: браузер из snap. Он не пишет файлы вне домашней папки -" ;
-           echo "          держи проект в ~/, иначе скриншоты выйдут пустыми." ;;
+case "$BROWSER" in
+  /snap/*) echo "внимание: браузер из snap - он не пишет файлы вне домашней папки." ;
+           echo "          Держи проект в ~/, иначе снимки выйдут пустыми." ;;
 esac
+
+# Адрес должен отвечать ДО съёмки: иначе браузер послушно снимет страницу
+# «сайт недоступен», и проверяющие будут изучать её вместо сайта.
+if command -v curl >/dev/null 2>&1; then
+  if ! curl -sf --max-time 10 -o /dev/null "$URL"; then
+    echo "адрес не отвечает: $URL"
+    echo "Локальный просмотр не запущен или адрес неверный. Снимать нечего."
+    exit 2
+  fi
+fi
 
 mkdir -p "$OUT"
 echo "браузер: $BROWSER"
 echo "адрес:   $URL"
 
-snap() {
-  local name="$1" width="$2" height="$3"
-  local file="$OUT/${name}${LABEL:+-$LABEL}.png"
-  "$BROWSER" \
-    --headless --disable-gpu --no-sandbox \
-    --hide-scrollbars \
-    --force-prefers-reduced-motion \
-    --virtual-time-budget=6000 \
-    --window-size="${width},${height}" \
-    --screenshot="$file" \
-    "$URL" >/dev/null 2>&1
-  if [ -s "$file" ]; then
-    echo "  $file  ($(stat -c%s "$file") байт)"
-  else
-    echo "  НЕ СНЯЛОСЬ: $file"
-    return 1
-  fi
-}
-
-# Высота с запасом: обрезанный низ прячет ровно то, что чаще всего ломается.
-fail=0
-snap desktop 1440 3000 || fail=1
-snap tablet   768 2600 || fail=1
-snap mobile   390 2400 || fail=1
+node "$HERE/shots.js" "$URL" "$OUT" "$LABEL" "$BROWSER"
+rc=$?
 
 echo
-if [ "$fail" -ne 0 ]; then
-  echo "ИТОГ: сняты не все размеры"
+if [ "$rc" -ne 0 ]; then
+  echo "ИТОГ: съёмка не пройдена - смотри причину выше"
   exit 1
 fi
 echo "ИТОГ: три скриншота в $OUT"
-echo "Снимок выглядит пустым - обычно виноваты блоки с появлением при прокрутке."
-echo "Флаг --force-prefers-reduced-motion уже включён; если не помогло, отключи анимацию появления на время съёмки."
