@@ -31,11 +31,30 @@ const LOAD_TIMEOUT = 20000;
 // Сколько ждём дорисовки после загрузки. Виджеты карт, отзывов и форм
 // приходят позже, и замер перелива по недорисованной странице врёт.
 // Медленный сторонний виджет - увеличить: SHOTS_WAIT=12 ./scripts/shots.sh ...
-const SETTLE_MIN = (Number(process.env.SHOTS_WAIT) || 5) * 1000;
+const WAIT_RAW = process.env.SHOTS_WAIT;
+let waitSeconds = 5;
+let waitComplaint = '';
+if (WAIT_RAW !== undefined && WAIT_RAW !== '') {
+  const n = Number(WAIT_RAW);
+  if (!Number.isFinite(n) || n < 0) {
+    waitComplaint = `SHOTS_WAIT=${WAIT_RAW} - это не число секунд, жду ${waitSeconds} секунд`;
+  } else {
+    waitSeconds = n;
+  }
+}
+const SETTLE_MIN = waitSeconds * 1000;
 const SETTLE_MAX = SETTLE_MIN + 10000;
+
+if (!URL_ARG || !OUT_DIR || !BROWSER) {
+  console.log('как запускать: node shots.js <адрес> <папка для кадров> <метка|""> <путь к браузеру>');
+  console.log('обычно этот скрипт запускается через ./scripts/shots.sh');
+  process.exit(NECHEM);
+}
+if (waitComplaint) console.log(waitComplaint);
 
 const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'shots-profile-'));
 let browser = null;
+let finishing = false;
 let abortAll = () => {};      // заполняется при подключении: отклонить всё, что ждёт ответа
 
 // Старые снимки удаляем до съёмки: иначе неснятый кадр оставит вчерашнюю
@@ -54,15 +73,24 @@ async function cleanup() {
   } catch { /* временный профиль - не повод падать */ }
 }
 
-function finish(code, lines = []) {
+function finish(code, lines = [], dropShots = false) {
+  if (finishing) return;
+  finishing = true;
   // Частичная съёмка - не доказательство: одинокий кадр легко принять за
-  // полный комплект. Оставляем снимки только когда сняты все три ширины.
-  if (code !== 0) for (const f of targets) fs.rmSync(f, { force: true });
+  // полный комплект. Но найденный перелив кадры не отменяет - они нужны
+  // проверяющему именно тогда, когда поломка нашлась.
+  if (dropShots) for (const f of targets) fs.rmSync(f, { force: true });
   cleanup().then(() => {
     for (const l of lines) console.log(l);
     process.exit(code);
   });
 }
+
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => finish(NECHEM, [`съёмка прервана (${sig})`], true));
+}
+process.on('unhandledRejection', (e) => finish(NECHEM, [`съёмка не состоялась: ${e && e.message ? e.message : e}`], true));
+process.on('uncaughtException', (e) => finish(NECHEM, [`съёмка не состоялась: ${e && e.message ? e.message : e}`], true));
 
 browser = spawn(BROWSER, [
   '--headless=new', '--disable-gpu', '--no-sandbox',
@@ -72,6 +100,8 @@ browser = spawn(BROWSER, [
   '--hide-scrollbars',
   'about:blank',
 ], { stdio: ['ignore', 'ignore', 'pipe'] });
+
+browser.on('error', (e) => finish(NECHEM, [`браузер не запустился: ${e.message}`], true));
 
 let stderr = '';
 const wsReady = new Promise((resolve, reject) => {
@@ -92,7 +122,8 @@ function connect(url) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(url);
     const waiting = new Map();
-    const events = new Map();      // имя события -> список ожидающих
+    const events = new Map();      // имя события -> список разовых ожидающих
+    const handlers = new Map();    // имя события -> постоянные обработчики
     let id = 0;
 
     // Оборванное соединение обязано отклонить все висящие запросы: иначе
@@ -123,6 +154,11 @@ function connect(url) {
           });
         });
       },
+      on(eventName, handler) {
+        const list = handlers.get(eventName) || [];
+        list.push(handler);
+        handlers.set(eventName, list);
+      },
       once(eventName, timeoutMs) {
         return new Promise((res, rej) => {
           const timer = setTimeout(() => res('не дождались'), timeoutMs);
@@ -142,6 +178,8 @@ function connect(url) {
     ws.onmessage = (ev) => {
       const data = JSON.parse(ev.data);
       if (data.method) {
+        const perm = handlers.get(data.method);
+        if (perm) for (const h of perm) h(data.params);
         const list = events.get(data.method);
         if (list) { events.delete(data.method); for (const { res } of list) res(data.params); }
         return;
@@ -164,9 +202,20 @@ function connect(url) {
 
   await call('Page.enable');
   await call('Runtime.enable');
+  await call('Network.enable');
+
+  // Пока в сети есть незавершённые запросы, страница ещё дорисовывается.
+  // Одних размеров мало: между двумя порциями данных они стоят на месте,
+  // и страница выглядит успокоившейся, хотя это всего лишь пауза.
+  let inflight = 0;
+  cdp.on('Network.requestWillBeSent', () => { inflight += 1; });
+  const done = () => { inflight = Math.max(0, inflight - 1); };
+  cdp.on('Network.loadingFinished', done);
+  cdp.on('Network.loadingFailed', done);
 
   const results = [];
-  const problems = [];
+  const notShot = [];      // ширина не снята вовсе
+  const doubts = [];       // кадр есть, но доверять замеру нельзя
   let reported = '';
 
   for (const size of SIZES) {
@@ -181,12 +230,13 @@ function connect(url) {
     const loaded = cdp.once('Page.loadEventFired', LOAD_TIMEOUT);   // подписка до перехода
     const nav = await call('Page.navigate', { url: URL_ARG });
     if (nav.errorText) {
-      problems.push(`${size.name}: страница не открылась (${nav.errorText})`);
+      loaded.catch(() => {});          // ждать больше нечего, гасим ожидание
+      notShot.push(`${size.name}: страница не открылась (${nav.errorText})`);
       continue;
     }
     const waited = await loaded;
     if (waited === 'не дождались') {
-      problems.push(`${size.name}: страница не догрузилась за ${LOAD_TIMEOUT / 1000} секунд`);
+      notShot.push(`${size.name}: страница не догрузилась за ${LOAD_TIMEOUT / 1000} секунд`);
       continue;
     }
 
@@ -201,14 +251,18 @@ function connect(url) {
       const now = await evaluate(
         '(() => { const d = document.documentElement; return [d.scrollHeight, d.scrollWidth, document.readyState === "complete" ? 1 : 0].join("x"); })()',
       );
-      if (now === stable && now.endsWith('x1')) same += 1; else same = 0;
+      if (now === stable && now.endsWith('x1') && inflight === 0) same += 1; else same = 0;
       stable = now;
       // Раньше минимального срока не выходим: страница может выглядеть
       // спокойной ровно до того мгновения, когда придёт виджет.
-      if (same >= 2 && Date.now() - started >= SETTLE_MIN) break;
+      // Три замера подряд - чуть больше секунды покоя при тихой сети.
+      if (same >= 3 && Date.now() - started >= SETTLE_MIN) break;
     }
-    if (same < 2) {
-      problems.push(`${size.name}: страница не успокоилась за ${SETTLE_MAX / 1000} секунд, кадр может быть недорисован`);
+    // Кадр снимем - глазами он полезен, - но замер перелива по меняющейся
+    // странице недостоверен, и вердикт по ней не ставится.
+    const restless = same < 3;
+    if (restless) {
+      doubts.push(`${size.name}: страница не успокоилась за ${SETTLE_MAX / 1000} секунд, кадр недорисован`);
     }
 
     const info = await evaluate(`(() => {
@@ -223,20 +277,22 @@ function connect(url) {
     })()`);
 
     if (info.errorPage) {
-      problems.push(`${size.name}: браузер показал страницу ошибки, а не сайт`);
+      notShot.push(`${size.name}: браузер показал страницу ошибки, а не сайт`);
       continue;
     }
     if (!info.height || info.height < 50) {
-      problems.push(`${size.name}: страница пустая (высота ${info.height}px)`);
+      notShot.push(`${size.name}: страница пустая (высота ${info.height}px)`);
       continue;
     }
-    if (info.href && info.href !== URL_ARG && !reported) {
-      reported = info.href;
+    if (info.href && !reported) {
+      let same_url = false;
+      try { same_url = new URL(info.href).href === new URL(URL_ARG).href; } catch { same_url = info.href === URL_ARG; }
+      if (!same_url) reported = info.href;
     }
 
     const height = Math.min(info.height, MAX_HEIGHT);
     if (info.height > MAX_HEIGHT) {
-      problems.push(`${size.name}: страница ${info.height}px, кадр обрезан до ${MAX_HEIGHT}px - снимай отдельные секции`);
+      doubts.push(`${size.name}: страница ${info.height}px, кадр обрезан до ${MAX_HEIGHT}px - снимай отдельные секции`);
     }
 
     const shot = await call('Page.captureScreenshot', {
@@ -246,15 +302,16 @@ function connect(url) {
     });
     fs.writeFileSync(file, Buffer.from(shot.data, 'base64'));
 
-    results.push({ ...size, file, height, overflow: info.scrollWidth - info.innerWidth });
+    results.push({ ...size, file, height, restless, overflow: info.scrollWidth - info.innerWidth });
     console.log(`  ${file}  (${size.width}x${height}, ${fs.statSync(file).size} байт)`);
   }
 
   cdp.close();
 
   const out = [''];
-  if (reported) out.push(`снято по адресу ${reported} - он отличается от запрошенного, была переадресация`);
-  for (const p of problems) out.push(`  НЕ СНЯТО ${p}`);
+  if (reported) out.push(`снято по адресу ${reported} - была переадресация с запрошенного`);
+  for (const p of notShot) out.push(`  НЕ СНЯТО ${p}`);
+  for (const d of doubts) out.push(`  ПОД СОМНЕНИЕМ ${d}`);
 
   const spilled = results.filter((r) => r.overflow > 1);
   if (spilled.length) {
@@ -263,12 +320,19 @@ function connect(url) {
     out.push('Это критичная находка вёрстки: на телефоне страница ездит вбок.');
   }
 
-  // Успех - только когда сняты все три ширины и ни одна не переливается.
+  // Сняты не все ширины - доказательства нет, кадры удаляем.
   if (results.length !== SIZES.length) {
     out.push(`снято ширин: ${results.length} из ${SIZES.length} - съёмка не состоялась`);
+    return finish(NECHEM, out, true);
+  }
+  // Перелив - вердикт о вёрстке, кадры при этом нужны проверяющему.
+  if (spilled.length) return finish(POLOMKA, out);
+  // Страница менялась во время замера: вердикт «перелива нет» тут был бы враньём.
+  if (results.some((r) => r.restless)) {
+    out.push('вердикт по перелеву не ставится: страница менялась во время замера');
+    out.push('дай ей больше времени: SHOTS_WAIT=12 ./scripts/shots.sh ...');
     return finish(NECHEM, out);
   }
-  if (spilled.length) return finish(POLOMKA, out);
   out.push('перелива нет ни на одной ширине');
   return finish(0, out);
 })().catch((e) => {
