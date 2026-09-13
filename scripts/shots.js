@@ -26,7 +26,7 @@ const SIZES = [
   { name: 'mobile', width: 390 },
 ];
 const MAX_HEIGHT = 20000;      // выше этого кадр не читается ни человеком, ни ролью
-const CALL_TIMEOUT = 30000;
+const CALL_TIMEOUT = 15000;   // столько ждём ответа браузера, прежде чем считать съёмку несостоявшейся
 const LOAD_TIMEOUT = 20000;
 // Сколько ждём дорисовки после загрузки. Виджеты карт, отзывов и форм
 // приходят позже, и замер перелива по недорисованной странице врёт.
@@ -36,6 +36,7 @@ const SETTLE_MAX = SETTLE_MIN + 10000;
 
 const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'shots-profile-'));
 let browser = null;
+let abortAll = () => {};      // заполняется при подключении: отклонить всё, что ждёт ответа
 
 // Старые снимки удаляем до съёмки: иначе неснятый кадр оставит вчерашнюю
 // картинку, и проверяющий будет судить о странице, которой уже нет.
@@ -80,7 +81,11 @@ const wsReady = new Promise((resolve, reject) => {
     const m = stderr.match(/ws:\/\/[^\s]+/);
     if (m) { clearTimeout(timer); resolve(m[0]); }
   });
-  browser.on('exit', (code) => { clearTimeout(timer); reject(new Error(`браузер завершился с кодом ${code}`)); });
+  browser.on('exit', (code) => {
+    clearTimeout(timer);
+    abortAll(`браузер завершился с кодом ${code}`);
+    reject(new Error(`браузер завершился с кодом ${code}`));
+  });
 });
 
 function connect(url) {
@@ -131,6 +136,9 @@ function connect(url) {
 
     ws.onerror = () => { abort('соединение с браузером оборвалось'); reject(new Error('не удалось подключиться к браузеру')); };
     ws.onclose = () => abort('браузер закрылся посреди съёмки');
+    // Браузер может умереть, не закрыв сокет: тогда без этого обработчика
+    // ответа пришлось бы ждать полный таймаут вызова.
+    abortAll = (why) => { abort(why); try { ws.close(); } catch { /* уже закрыт */ } };
     ws.onmessage = (ev) => {
       const data = JSON.parse(ev.data);
       if (data.method) {
